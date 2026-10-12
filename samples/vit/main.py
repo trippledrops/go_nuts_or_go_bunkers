@@ -1,6 +1,7 @@
 import torch
 
 from vit import VisionTransformer, make_dataset, train_loop
+from vit_rope import ViTWith2DRoPE
 
 def main():
     # Setup hyperparameters
@@ -37,8 +38,19 @@ def main():
         epochs=epochs
     )
     print("Training finished successfully!")
+    ############ RoPE ##############
+    vit = ViTWith2DRoPE(patch_size=16, embed_dim=128, num_heads=4)
+    # Test Case A: Standard Square Image (224x224)
+    img_square = torch.randn(2, 3, 224, 224)
+    out_square = vit(img_square)
+    # Patches: (224/16) * (224/16) = 196. Plus CLS token = 197 tokens.
+    print(f"Square Image Output Shape: {out_square.shape}")  # Expected: [2, 197, 128]
 
+    # Test Case B: Panoramic/Wide Image with Variable Aspect Ratio (112x448)
+    img_wide = torch.randn(2, 3, 112, 448)
+    out_wide = vit(img_wide)
+    # Patches: (112/16) * (448/16) = 7 * 28 = 196. Plus CLS token = 197 tokens.
+    print(f"Wide Image Output Shape:   {out_wide.shape}")    # Expected: [2, 197, 128]
 
 if __name__ == "__main__":
     main()
-
