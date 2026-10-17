@@ -46,7 +46,8 @@ class ViTPatchEmbedding(nn.Module):
 # 2. Multi-Head Self-Attention (MHSA)
 # ==========================================
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, attn_drop: float = 0.0, proj_drop: float = 0.0):
+    def __init__(self, embed_dim: int, num_heads: int, attn_drop: float = 0.0, proj_drop: float = 0.0,
+        use_flash_attention = False, flash_attn_block_size = (8, 8)):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
@@ -58,6 +59,8 @@ class MultiHeadSelfAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(embed_dim, embed_dim)  # Linear mapping after attention
         self.proj_drop = nn.Dropout(proj_drop)
+        self.use_flash_attention = use_flash_attention
+        self.flash_attn_block_size = flash_attn_block_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # input x shape: (B, N, D)  -> N sequence length (1 + H*W/P^2)
@@ -70,13 +73,19 @@ class MultiHeadSelfAttention(nn.Module):
         
         # 2. Calculate Attention Score (Q @ K transpose)
         # (B, num_heads, N, head_dim) x (B, num_heads, head_dim, N) -> (B, num_heads, N, N)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        
-        # 3. weight multiplies V
-        # (B, num_heads, N, N) x (B, num_heads, N, head_dim) -> (B, num_heads, N, head_dim)
-        x = attn @ v
+        if self.use_flash_attention:
+            # Simulate the tiling computation of Flash attention v2.
+            # Note: We only implement inference, so no backward support during training.
+            x = self.infer_flash_attention(q, k, v)
+        else:
+            # Normal attention without tiling.
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            
+            # 3. weight multiplies V
+            # (B, num_heads, N, N) x (B, num_heads, N, head_dim) -> (B, num_heads, N, head_dim)
+            x = attn @ v
         
         # 4. Concatenate multi head back
         # (B, num_heads, N, head_dim) -> (B, N, num_heads, head_dim) -> (B, N, D)
@@ -86,6 +95,64 @@ class MultiHeadSelfAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
+    def infer_flash_attention(self, q, k, v):
+        batch, num_heads, seq_len, head_dim = q.shape
+        tile_h, tile_w = self.flash_attn_block_size
+
+        output = torch.zeros_like(v)  # Buffer for the final output (simulate HBM storage).
+        for y in range(0, seq_len, tile_h):
+            # Simulate that we fetch tiles of K, Q, V from the HBM.
+            q_tile = q[:, :, y:y + tile_h, :]  # (B, H, tile_h, D)
+            # Flash Attenion wants the inner loop to be entirely on the GPU SRAM.
+
+            # Output of the current row block (tile_h = num of queries in this row block).
+            out_y = torch.zeros([batch, num_heads, tile_h, head_dim])
+            running_row_max_y = torch.full([batch, num_heads, tile_h, 1], -torch.inf)  # One row max per query row.
+            row_exp_sum_y = torch.zeros([batch, num_heads, tile_h, 1])  # Row sum(exp(score)) of each query in this row block.
+
+            for x in range(0, seq_len, tile_w):
+                k_tile = k[:, :, x:x + tile_w, :]  # (B, H, tile_w, D)
+                v_tile = v[:, :, x:x + tile_w, :]  # (B, H, tile_w, D)
+                # Compute the score matrix: (B, H, N / tile_rows, D) @ (B, H, D, tile_w)
+                s_tile = (q_tile @ k_tile.transpose(-2, -1)) * self.scale  #  (B, H, tile_h, tile_w)
+
+                # Online softmax for this tile: exp(S[i] - rowmax) / sum(exp(S[i] - rowmax))
+                # At this point, we haven't finished iterating the whole row, so we don't
+                # know the global rowmax and row sum of the whole row.
+                # So we use the running rowmax and rowsum for now, and correct the scales later.
+
+                # Max of each row slice with tile_w elements, one per row (B, H, tile_h, 1).
+                tile_row_max, _ = torch.max(s_tile, dim=-1, keepdim=True)
+                old_running_row_max_y = running_row_max_y
+                running_row_max_y = torch.maximum(running_row_max_y, tile_row_max)  # (B, H, tile_h, 1)
+
+                p_tile = torch.exp(s_tile - running_row_max_y)  # (B, H, tile_h, tile_w)
+                tile_yx_row_sum = torch.sum(p_tile, dim=-1, keepdim=True)  # (B, H, tile_h, 1)
+
+                # The real sum(exp(S - global_row_max)) cannot be computed directly
+                # since we use running row max, not the global row max.
+                # However, they only differ by a scale. So whenever we have an updated
+                # running row max, we re-scale previous running row sum exp to correct for the scale difference.
+                # scale = exp(old_max) / exp(new_max)    <<--- bug found by Gemini.
+                scale = torch.exp(old_running_row_max_y - running_row_max_y)
+
+                # This is recommended by Gemini to fix numeric issues.
+                scale = torch.nan_to_num(scale, nan=0.0)  # On step 0, exp(-inf - max) -> 0.0
+
+                row_exp_sum_y = scale * row_exp_sum_y + tile_yx_row_sum
+
+                # (B, H, tile_h, tile_w) @ (B, H, tile_w, D) -> (B, H, tile_h, D)
+                # After each x, the output shape is always (B, H, tile_h, D), but its values are
+                # not correct since it should be weighted time of ALL values, not the values in the tile.
+                # So we need to keep accumulate the sum of weight v_tile into the output.
+                out_y = scale * out_y + (p_tile @ v_tile)  # Weighted V for the current tile (y, x).
+
+            # Flash attention writes outputs from SRAM to HBM here.
+            # Here results of multiple queries are computed and written.
+            # (B, H, tile_h, D)
+            output[:, :, y:y + tile_h, :] = out_y / row_exp_sum_y
+        return output
 
 # ==========================================
 # 3. Transformer Block
